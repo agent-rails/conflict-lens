@@ -61,6 +61,20 @@ type Resolver interface {
 	Resolve(newContent string, candidate Fact) (Action, string, error)
 }
 
+// MultiResolver is an optional extension of Resolver. It judges one new fact
+// against several candidates in a single call, so the judge can compare them side
+// by side and the cost is one call instead of one per candidate. A Resolver that
+// also implements it is used when MaxCandidates is greater than one.
+//
+// ResolveAmong returns the action and the index into candidates of the fact it
+// applies to. For ActionAdd the index is ignored. For ActionUpdate and
+// ActionDuplicate the index must be in range, otherwise the Engine treats the
+// answer as invalid and adds the fact.
+type MultiResolver interface {
+	Resolver
+	ResolveAmong(newContent string, candidates []Fact) (Action, int, string, error)
+}
+
 // Engine applies a token-overlap heuristic, optionally deferring borderline
 // cases to a Resolver.
 //
@@ -75,6 +89,14 @@ type Engine struct {
 	DupThreshold      float64  // default 0.85
 	ConflictThreshold float64  // default 0.45
 	Resolver          Resolver // optional; consulted in the conflict band
+
+	// MaxCandidates bounds how many candidates in the conflict band the Resolver
+	// may examine, most similar first. Zero or one keeps the original behavior:
+	// only the single best lexical match is consulted. Raise it when the best
+	// lexical match can be about a different subject than the new fact (for
+	// example "Nadia works at Acme" versus "Marisol works at Acme"), so the
+	// Resolver can reject it and still reach the fact that is really superseded.
+	MaxCandidates int
 }
 
 // NewEngine returns an Engine with sensible defaults and no Resolver.
@@ -90,7 +112,6 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 		return Decision{Action: ActionAdd, Reason: "no comparable existing facts"}
 	}
 
-	// Find the most similar existing fact.
 	best := -1
 	bestSim := 0.0
 	for i, c := range candidates {
@@ -111,6 +132,13 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 
 	case bestSim >= e.ConflictThreshold:
 		// Borderline: an optional Resolver gets the final say.
+		if e.Resolver != nil && e.MaxCandidates > 1 {
+			ranked := rankBySimilarity(newTokens, candidates)
+			if multi, ok := e.Resolver.(MultiResolver); ok {
+				return e.resolveBatch(multi, newContent, candidates, ranked)
+			}
+			return e.resolveWalk(newContent, candidates, ranked)
+		}
 		if e.Resolver != nil {
 			if act, reason, err := e.Resolver.Resolve(newContent, target); err == nil {
 				return Decision{Action: act, TargetID: target.ID, Similarity: bestSim, Reason: reason}
@@ -126,7 +154,91 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 	}
 }
 
+func validAction(a Action) bool {
+	return a == ActionAdd || a == ActionUpdate || a == ActionDuplicate
+}
+
+// resolveBatch sends the top MaxCandidates candidates at or above ConflictThreshold
+// to a MultiResolver in one call. Any failure or invalid answer adds the fact and
+// supersedes nothing: when the judge cannot decide, no existing fact is erased.
+func (e *Engine) resolveBatch(m MultiResolver, newContent string, candidates []Fact, ranked []scored) Decision {
+	picked := ranked[:0:0]
+	for _, s := range ranked {
+		if len(picked) == e.MaxCandidates || s.sim < e.ConflictThreshold {
+			break
+		}
+		picked = append(picked, s)
+	}
+	batch := make([]Fact, len(picked))
+	for i, s := range picked {
+		batch[i] = candidates[s.index]
+	}
+	act, idx, reason, err := m.ResolveAmong(newContent, batch)
+	if err != nil {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+			Reason: "resolver failed — keeping both facts"}
+	}
+	if !validAction(act) {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+			Reason: "resolver returned an undefined action — keeping both facts"}
+	}
+	if act == ActionAdd {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: reason}
+	}
+	if idx < 0 || idx >= len(batch) {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+			Reason: "resolver returned an invalid candidate index — keeping both facts"}
+	}
+	return Decision{Action: act, TargetID: batch[idx].ID, Similarity: picked[idx].sim, Reason: reason}
+}
+
+// resolveWalk consults the Resolver on up to MaxCandidates candidates at or above
+// ConflictThreshold, most similar first. The first candidate the Resolver does not
+// classify as Add decides the outcome. If every consulted candidate is Add, the
+// result is Add with no target. Any error or undefined action adds the fact and
+// supersedes nothing, so a failing Resolver can never erase a stored fact.
+func (e *Engine) resolveWalk(newContent string, candidates []Fact, ranked []scored) Decision {
+	last := Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: "no candidate to consult"}
+	consulted := 0
+	for _, s := range ranked {
+		if consulted == e.MaxCandidates || s.sim < e.ConflictThreshold {
+			break
+		}
+		cand := candidates[s.index]
+		act, reason, err := e.Resolver.Resolve(newContent, cand)
+		if err != nil || !validAction(act) {
+			return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+				Reason: "resolver failed or answered invalidly — keeping both facts"}
+		}
+		consulted++
+		if act != ActionAdd {
+			return Decision{Action: act, TargetID: cand.ID, Similarity: s.sim, Reason: reason}
+		}
+		last = Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: reason}
+	}
+	return last
+}
+
 // ── token similarity ─────────────────────────────────────────────────────────
+
+type scored struct {
+	index int
+	sim   float64
+}
+
+// rankBySimilarity returns candidates with non-zero overlap, most similar first.
+// Equal similarities keep input order. A candidate that shares no word with the
+// new fact is never offered to a Resolver, even when ConflictThreshold is zero.
+func rankBySimilarity(newTokens map[string]struct{}, candidates []Fact) []scored {
+	out := make([]scored, 0, len(candidates))
+	for i, c := range candidates {
+		if sim := jaccard(newTokens, tokenize(c.Content)); sim > 0 {
+			out = append(out, scored{index: i, sim: sim})
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool { return out[a].sim > out[b].sim })
+	return out
+}
 
 // stopwords are dropped so the overlap reflects content words, not grammar.
 var stopwords = map[string]struct{}{
