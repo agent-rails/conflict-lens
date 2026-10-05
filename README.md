@@ -56,7 +56,7 @@ e.ConflictThreshold = 0.1 // let weaker overlaps qualify
 e.MaxCandidates = 10      // at most ten judge calls per fact
 ```
 
-The first candidate the Resolver does not call `add` decides the outcome. With `MaxCandidates` above one, any Resolver error or undefined action adds the fact and supersedes nothing, so a failing Resolver can never erase a stored fact. With the default (zero or one) behavior is exactly as before, including the heuristic fallback when the Resolver errors; a randomized differential test against the previous release checks this.
+The first candidate the Resolver does not call `add` decides the outcome. With `MaxCandidates` above one and a Resolver configured, any Resolver error or undefined action adds the fact and supersedes nothing, so a failing Resolver can never erase a stored fact. Without a Resolver the heuristic still decides, as before. A candidate that shares no word with the new fact is never offered to the Resolver. With the default (zero or one) behavior is exactly as before, including the heuristic fallback when the Resolver errors; a randomized differential test against the previous release checks this.
 
 A Resolver may also implement `MultiResolver` (`ResolveAmong`) to judge all candidates in one call. An invalid answer, or an error, adds the fact. In one evaluation with an 8B local model, a single batched call over ten candidates proposed a replacement for unrelated facts far too often; pairing it with a per-candidate check removed that damage but left more facts stale than judging candidates one at a time. Measure it with your own model before relying on it.
 

@@ -112,12 +112,18 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 		return Decision{Action: ActionAdd, Reason: "no comparable existing facts"}
 	}
 
-	ranked := rankBySimilarity(newTokens, candidates)
-	if len(ranked) == 0 {
+	best := -1
+	bestSim := 0.0
+	for i, c := range candidates {
+		sim := jaccard(newTokens, tokenize(c.Content))
+		if sim > bestSim {
+			bestSim, best = sim, i
+		}
+	}
+	if best < 0 {
 		return Decision{Action: ActionAdd, Reason: "no token overlap with existing facts"}
 	}
-	bestSim := ranked[0].sim
-	target := candidates[ranked[0].index]
+	target := candidates[best]
 
 	switch {
 	case bestSim >= e.DupThreshold:
@@ -127,6 +133,7 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 	case bestSim >= e.ConflictThreshold:
 		// Borderline: an optional Resolver gets the final say.
 		if e.Resolver != nil && e.MaxCandidates > 1 {
+			ranked := rankBySimilarity(newTokens, candidates)
 			if multi, ok := e.Resolver.(MultiResolver); ok {
 				return e.resolveBatch(multi, newContent, candidates, ranked)
 			}
@@ -220,7 +227,8 @@ type scored struct {
 }
 
 // rankBySimilarity returns candidates with non-zero overlap, most similar first.
-// Equal similarities keep input order.
+// Equal similarities keep input order. A candidate that shares no word with the
+// new fact is never offered to a Resolver, even when ConflictThreshold is zero.
 func rankBySimilarity(newTokens map[string]struct{}, candidates []Fact) []scored {
 	out := make([]scored, 0, len(candidates))
 	for i, c := range candidates {
