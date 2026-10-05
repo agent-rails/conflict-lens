@@ -45,17 +45,36 @@ e := conflict.NewEngine()
 e.Resolver = myClaudeResolver // consulted only in the conflict band
 ```
 
+### Examining several candidates
+
+By default the Resolver sees only the single most similar candidate. When that candidate may be about a different subject than the new fact ("Nadia works at Acme" against "Marisol works at Acme"), a perfect judge can only answer "add" and the fact that is really superseded is never examined. Set `MaxCandidates` above one to let the Resolver examine the top candidates in order, most similar first, at or above `ConflictThreshold`:
+
+```go
+e := conflict.NewEngine()
+e.Resolver = myResolver
+e.ConflictThreshold = 0.1 // let weaker overlaps qualify
+e.MaxCandidates = 10      // at most ten judge calls per fact
+```
+
+The first candidate the Resolver does not call `add` decides the outcome. If it errors after rejecting an earlier candidate, the fact is added and nothing is superseded. An error on the first candidate keeps the original behavior (the heuristic decides).
+
+A Resolver may also implement `MultiResolver` (`ResolveAmong`) to judge all candidates in one call. An invalid answer, or an error, adds the fact. In one evaluation with an 8B local model, a single batched call over ten candidates proposed a replacement for unrelated facts far too often; pairing it with a per-candidate check removed that damage but left more facts stale than judging candidates one at a time. Measure it with your own model before relying on it.
+
 ### Known limitation
 Very short antonym flips — "I love my job" → "I hate my job" — share only `job` after stopword removal (≈0.33), the *same* score as an additive change ("likes Python" → "likes Rust"). Lexically these are indistinguishable, so the bare heuristic conservatively returns `add` (never wrongly erases a fact). Resolving them correctly needs semantics — that's what the `Resolver` is for. Documented and tested rather than papered over by lowering the threshold (which would wrongly supersede additive facts).
 
+### Subject confusion
+
+The overlap score counts every shared word, including a person's name. Two different people who share a surname and a value ("Marisol Bellweather works at Harbor Partners", "Nadia Bellweather works at Harbor Partners") can score above the conflict threshold, so the bare heuristic may supersede the wrong person's fact. On a held-out synthetic evaluation with an Ollama judge, wrongful replacement fell from 72% to 8%, but stale facts were not reduced in general because the right fact was often outside the top candidates. See the MemKit evaluation write-up for the data and limits.
+
 ## API
 
-- `NewEngine() *Engine` — defaults: `DupThreshold 0.85`, `ConflictThreshold 0.45`
+- `NewEngine() *Engine` — defaults: `DupThreshold 0.85`, `ConflictThreshold 0.45`, `MaxCandidates 0` (best candidate only)
 - `(*Engine).Resolve(newContent string, candidates []Fact) Decision`
 - `Fact{ID, Content}` — adapt your own model into this
 - `Decision{Action, TargetID, Similarity, Reason}`
 - `Action`: `ActionAdd | ActionUpdate | ActionDuplicate`
-- `Resolver` interface for optional semantic resolution
+- `Resolver` interface for optional semantic resolution; `MultiResolver` for judging several candidates in one call
 
 ## License
 
