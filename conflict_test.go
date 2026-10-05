@@ -288,3 +288,142 @@ func TestResolve_ResolverErrorAfterRejectionKeepsBothFacts(t *testing.T) {
 		t.Fatalf("an error after a rejection must not supersede the rejected candidate, got %s target=%q", d.Action, d.TargetID)
 	}
 }
+
+type scriptedMulti struct {
+	got    [][]string
+	decide func(newContent string, candidates []Fact) (Action, int, string, error)
+}
+
+func (s *scriptedMulti) Resolve(string, Fact) (Action, string, error) {
+	return ActionAdd, "single path must not be used", errors.New("single path used")
+}
+
+func (s *scriptedMulti) ResolveAmong(newContent string, candidates []Fact) (Action, int, string, error) {
+	ids := make([]string, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.ID
+	}
+	s.got = append(s.got, ids)
+	return s.decide(newContent, candidates)
+}
+
+func pickSubject(subject string) func(string, []Fact) (Action, int, string, error) {
+	return func(_ string, cs []Fact) (Action, int, string, error) {
+		for i, c := range cs {
+			if strings.Contains(c.Content, subject) {
+				return ActionUpdate, i, "same subject", nil
+			}
+		}
+		return ActionAdd, -1, "none", nil
+	}
+}
+
+func manyFacts() []Fact {
+	return []Fact{
+		{ID: "a", Content: "Nadia Bellweather works at Harbor Partners"},
+		{ID: "b", Content: "Idris Okonkwo works at Harbor Partners"},
+		{ID: "mine", Content: "Marisol Bellweather works at Cinder Labs"},
+		{ID: "c", Content: "Ines Ferreira works at Harbor Partners"},
+	}
+}
+
+func TestMulti_OneCallPicksTheRightCandidate(t *testing.T) {
+	m := &scriptedMulti{decide: pickSubject("Marisol")}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = 4
+	e.Resolver = m
+	d := e.Resolve(crossSubjectNew, manyFacts())
+	if len(m.got) != 1 {
+		t.Fatalf("want exactly one batched call, got %d", len(m.got))
+	}
+	if d.Action != ActionUpdate || d.TargetID != "mine" {
+		t.Fatalf("want update of 'mine', got %s target=%q", d.Action, d.TargetID)
+	}
+}
+
+func TestMulti_CandidatesAreRankedAndBounded(t *testing.T) {
+	m := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) { return ActionAdd, -1, "no", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = 2
+	e.Resolver = m
+	e.Resolve(crossSubjectNew, manyFacts())
+	if len(m.got) != 1 || len(m.got[0]) != 2 {
+		t.Fatalf("want one call with 2 candidates, got %v", m.got)
+	}
+}
+
+func TestMulti_NoCandidateAboveThresholdSkipsTheCall(t *testing.T) {
+	m := &scriptedMulti{decide: pickSubject("x")}
+	e := NewEngine()
+	e.MaxCandidates = 3
+	e.Resolver = m
+	d := e.Resolve("User is allergic to shellfish", []Fact{{ID: "1", Content: "User prefers Go for backend"}})
+	if d.Action != ActionAdd || len(m.got) != 0 {
+		t.Fatalf("want add without a call, got %s calls=%d", d.Action, len(m.got))
+	}
+}
+
+func TestMulti_ErrorKeepsBothFactsNeverSupersedes(t *testing.T) {
+	m := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) {
+		return ActionAdd, -1, "", errors.New("down")
+	}}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = 4
+	e.Resolver = m
+	d := e.Resolve(crossSubjectNew, manyFacts())
+	if d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("a failed batch call must add and supersede nothing, got %s target=%q", d.Action, d.TargetID)
+	}
+}
+
+func TestMulti_OutOfRangeIndexIsTreatedAsAnError(t *testing.T) {
+	for _, idx := range []int{-2, 99} {
+		m := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) { return ActionUpdate, idx, "bad", nil }}
+		e := NewEngine()
+		e.ConflictThreshold = 0.1
+		e.MaxCandidates = 4
+		e.Resolver = m
+		d := e.Resolve(crossSubjectNew, manyFacts())
+		if d.Action != ActionAdd || d.TargetID != "" {
+			t.Fatalf("index %d must not supersede anything, got %s target=%q", idx, d.Action, d.TargetID)
+		}
+	}
+}
+
+func TestMulti_UpdateWithoutTargetIsRejected(t *testing.T) {
+	m := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) { return ActionUpdate, -1, "no target", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = 4
+	e.Resolver = m
+	d := e.Resolve(crossSubjectNew, manyFacts())
+	if d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("update with index -1 must be treated as add, got %s target=%q", d.Action, d.TargetID)
+	}
+}
+
+func TestMulti_DuplicateIsHonored(t *testing.T) {
+	m := &scriptedMulti{decide: func(_ string, cs []Fact) (Action, int, string, error) { return ActionDuplicate, 0, "same", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = 4
+	e.Resolver = m
+	d := e.Resolve(crossSubjectNew, manyFacts())
+	if d.Action != ActionDuplicate || d.TargetID == "" {
+		t.Fatalf("want duplicate with a target, got %s target=%q", d.Action, d.TargetID)
+	}
+}
+
+func TestMulti_NotUsedWhenMaxCandidatesIsOne(t *testing.T) {
+	r := &scriptedMulti{decide: pickSubject("Marisol")}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.Resolver = r
+	e.Resolve(crossSubjectNew, manyFacts())
+	if len(r.got) != 0 {
+		t.Fatalf("with MaxCandidates<=1 the single-candidate path is used, got batched calls %v", r.got)
+	}
+}

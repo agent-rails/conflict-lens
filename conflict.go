@@ -61,6 +61,20 @@ type Resolver interface {
 	Resolve(newContent string, candidate Fact) (Action, string, error)
 }
 
+// MultiResolver is an optional extension of Resolver. It judges one new fact
+// against several candidates in a single call, so the judge can compare them side
+// by side and the cost is one call instead of one per candidate. A Resolver that
+// also implements it is used when MaxCandidates is greater than one.
+//
+// ResolveAmong returns the action and the index into candidates of the fact it
+// applies to. For ActionAdd the index is ignored. For ActionUpdate and
+// ActionDuplicate the index must be in range, otherwise the Engine treats the
+// answer as invalid and adds the fact.
+type MultiResolver interface {
+	Resolver
+	ResolveAmong(newContent string, candidates []Fact) (Action, int, string, error)
+}
+
 // Engine applies a token-overlap heuristic, optionally deferring borderline
 // cases to a Resolver.
 //
@@ -112,6 +126,9 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 
 	case bestSim >= e.ConflictThreshold:
 		// Borderline: an optional Resolver gets the final say.
+		if multi, ok := e.Resolver.(MultiResolver); ok && e.MaxCandidates > 1 {
+			return e.resolveBatch(multi, newContent, candidates, ranked)
+		}
 		if e.Resolver != nil {
 			if d, decided := e.resolveBand(newContent, candidates, ranked); decided {
 				return d
@@ -125,6 +142,36 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 	default:
 		return Decision{Action: ActionAdd, Similarity: bestSim, Reason: "low overlap — new information"}
 	}
+}
+
+// resolveBatch sends the top MaxCandidates candidates at or above ConflictThreshold
+// to a MultiResolver in one call. Any failure or invalid answer adds the fact and
+// supersedes nothing: when the judge cannot decide, no existing fact is erased.
+func (e *Engine) resolveBatch(m MultiResolver, newContent string, candidates []Fact, ranked []scored) Decision {
+	picked := make([]scored, 0, e.MaxCandidates)
+	for _, s := range ranked {
+		if len(picked) == e.MaxCandidates || s.sim < e.ConflictThreshold {
+			break
+		}
+		picked = append(picked, s)
+	}
+	batch := make([]Fact, len(picked))
+	for i, s := range picked {
+		batch[i] = candidates[s.index]
+	}
+	act, idx, reason, err := m.ResolveAmong(newContent, batch)
+	if err != nil {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+			Reason: "resolver failed — keeping both facts"}
+	}
+	if act == ActionAdd {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: reason}
+	}
+	if idx < 0 || idx >= len(batch) {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+			Reason: "resolver returned an invalid candidate index — keeping both facts"}
+	}
+	return Decision{Action: act, TargetID: batch[idx].ID, Similarity: picked[idx].sim, Reason: reason}
 }
 
 // resolveBand consults the Resolver on up to MaxCandidates candidates at or above
