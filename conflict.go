@@ -126,12 +126,15 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 
 	case bestSim >= e.ConflictThreshold:
 		// Borderline: an optional Resolver gets the final say.
-		if multi, ok := e.Resolver.(MultiResolver); ok && e.MaxCandidates > 1 {
-			return e.resolveBatch(multi, newContent, candidates, ranked)
+		if e.Resolver != nil && e.MaxCandidates > 1 {
+			if multi, ok := e.Resolver.(MultiResolver); ok {
+				return e.resolveBatch(multi, newContent, candidates, ranked)
+			}
+			return e.resolveWalk(newContent, candidates, ranked)
 		}
 		if e.Resolver != nil {
-			if d, decided := e.resolveBand(newContent, candidates, ranked); decided {
-				return d
+			if act, reason, err := e.Resolver.Resolve(newContent, target); err == nil {
+				return Decision{Action: act, TargetID: target.ID, Similarity: bestSim, Reason: reason}
 			}
 			// Resolver failed — fall through to the heuristic (fail toward update,
 			// which preserves history rather than accumulating contradictions).
@@ -144,11 +147,15 @@ func (e *Engine) Resolve(newContent string, candidates []Fact) Decision {
 	}
 }
 
+func validAction(a Action) bool {
+	return a == ActionAdd || a == ActionUpdate || a == ActionDuplicate
+}
+
 // resolveBatch sends the top MaxCandidates candidates at or above ConflictThreshold
 // to a MultiResolver in one call. Any failure or invalid answer adds the fact and
 // supersedes nothing: when the judge cannot decide, no existing fact is erased.
 func (e *Engine) resolveBatch(m MultiResolver, newContent string, candidates []Fact, ranked []scored) Decision {
-	picked := make([]scored, 0, e.MaxCandidates)
+	picked := ranked[:0:0]
 	for _, s := range ranked {
 		if len(picked) == e.MaxCandidates || s.sim < e.ConflictThreshold {
 			break
@@ -164,6 +171,10 @@ func (e *Engine) resolveBatch(m MultiResolver, newContent string, candidates []F
 		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
 			Reason: "resolver failed — keeping both facts"}
 	}
+	if !validAction(act) {
+		return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
+			Reason: "resolver returned an undefined action — keeping both facts"}
+	}
 	if act == ActionAdd {
 		return Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: reason}
 	}
@@ -174,40 +185,31 @@ func (e *Engine) resolveBatch(m MultiResolver, newContent string, candidates []F
 	return Decision{Action: act, TargetID: batch[idx].ID, Similarity: picked[idx].sim, Reason: reason}
 }
 
-// resolveBand consults the Resolver on up to MaxCandidates candidates at or above
+// resolveWalk consults the Resolver on up to MaxCandidates candidates at or above
 // ConflictThreshold, most similar first. The first candidate the Resolver does not
 // classify as Add decides the outcome. If every consulted candidate is Add, the
-// result is Add with no target. decided is false when the Resolver errored on
-// the first candidate, so the caller can apply the heuristic. An error after at
-// least one rejection yields Add: the heuristic must not supersede a candidate
-// the Resolver already rejected.
-func (e *Engine) resolveBand(newContent string, candidates []Fact, ranked []scored) (Decision, bool) {
-	limit := e.MaxCandidates
-	if limit < 1 {
-		limit = 1
-	}
-	var last Decision
+// result is Add with no target. Any error or undefined action adds the fact and
+// supersedes nothing, so a failing Resolver can never erase a stored fact.
+func (e *Engine) resolveWalk(newContent string, candidates []Fact, ranked []scored) Decision {
+	last := Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: "no candidate to consult"}
 	consulted := 0
 	for _, s := range ranked {
-		if consulted == limit || s.sim < e.ConflictThreshold {
+		if consulted == e.MaxCandidates || s.sim < e.ConflictThreshold {
 			break
 		}
 		cand := candidates[s.index]
 		act, reason, err := e.Resolver.Resolve(newContent, cand)
-		if err != nil {
-			if consulted == 0 {
-				return Decision{}, false
-			}
+		if err != nil || !validAction(act) {
 			return Decision{Action: ActionAdd, Similarity: ranked[0].sim,
-				Reason: "resolver failed after rejecting earlier candidates — keeping both facts"}, true
+				Reason: "resolver failed or answered invalidly — keeping both facts"}
 		}
 		consulted++
 		if act != ActionAdd {
-			return Decision{Action: act, TargetID: cand.ID, Similarity: s.sim, Reason: reason}, true
+			return Decision{Action: act, TargetID: cand.ID, Similarity: s.sim, Reason: reason}
 		}
 		last = Decision{Action: ActionAdd, Similarity: ranked[0].sim, Reason: reason}
 	}
-	return last, true
+	return last
 }
 
 // ── token similarity ─────────────────────────────────────────────────────────

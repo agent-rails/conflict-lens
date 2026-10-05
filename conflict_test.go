@@ -2,6 +2,7 @@ package conflict
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -229,18 +230,43 @@ func TestResolve_MaxCandidatesSkipsCandidatesBelowThreshold(t *testing.T) {
 	}
 }
 
-func TestResolve_ResolverErrorFallsBackToHeuristicOnBestCandidate(t *testing.T) {
+func TestResolve_MultiCandidateErrorAddsAndNeverSupersedes(t *testing.T) {
 	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "", errors.New("down") }}
 	e := NewEngine()
 	e.MaxCandidates = 3
 	e.Resolver = r
 	facts := []Fact{{ID: "old", Content: "User works at Google as a backend engineer"}}
 	d := e.Resolve("User works at OpenAI as a backend engineer", facts)
-	if d.Action != ActionUpdate || d.TargetID != "old" {
-		t.Fatalf("resolver error must keep the legacy heuristic update, got %s target=%q", d.Action, d.TargetID)
+	if d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("with MaxCandidates > 1 any resolver error must add, got %s target=%q", d.Action, d.TargetID)
 	}
 	if len(r.calls) != 1 {
 		t.Fatalf("an error must stop the walk, got calls=%v", r.calls)
+	}
+}
+
+func TestResolve_LegacyErrorStillFallsBackToHeuristic(t *testing.T) {
+	for _, max := range []int{0, 1} {
+		r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "", errors.New("down") }}
+		e := NewEngine()
+		e.MaxCandidates = max
+		e.Resolver = r
+		facts := []Fact{{ID: "old", Content: "User works at Google as a backend engineer"}}
+		d := e.Resolve("User works at OpenAI as a backend engineer", facts)
+		if d.Action != ActionUpdate || d.TargetID != "old" {
+			t.Fatalf("MaxCandidates=%d must keep the original fallback, got %s target=%q", max, d.Action, d.TargetID)
+		}
+	}
+}
+
+func TestResolve_LegacyAddVerdictKeepsBestCandidateID(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "resolver override", nil }}
+	e := NewEngine()
+	e.Resolver = r
+	facts := []Fact{{ID: "old", Content: "User works at Google as a backend engineer"}}
+	d := e.Resolve("User works at OpenAI as a backend engineer", facts)
+	if d.Action != ActionAdd || d.TargetID != "old" || d.Reason != "resolver override" {
+		t.Fatalf("default behavior must be unchanged, got %+v", d)
 	}
 }
 
@@ -349,8 +375,8 @@ func TestMulti_CandidatesAreRankedAndBounded(t *testing.T) {
 	e.MaxCandidates = 2
 	e.Resolver = m
 	e.Resolve(crossSubjectNew, manyFacts())
-	if len(m.got) != 1 || len(m.got[0]) != 2 {
-		t.Fatalf("want one call with 2 candidates, got %v", m.got)
+	if len(m.got) != 1 || len(m.got[0]) != 2 || m.got[0][0] != "a" || m.got[0][1] != "b" {
+		t.Fatalf("want one call with the two most similar candidates in order [a b], got %v", m.got)
 	}
 }
 
@@ -359,9 +385,28 @@ func TestMulti_NoCandidateAboveThresholdSkipsTheCall(t *testing.T) {
 	e := NewEngine()
 	e.MaxCandidates = 3
 	e.Resolver = m
-	d := e.Resolve("User is allergic to shellfish", []Fact{{ID: "1", Content: "User prefers Go for backend"}})
+	weak := []Fact{{ID: "weak", Content: "User enjoys backend reading"}}
+	if sim := jaccard(tokenize("User works at OpenAI as a backend engineer"), tokenize(weak[0].Content)); sim <= 0 || sim >= e.ConflictThreshold {
+		t.Fatalf("test setup: want positive overlap below the threshold, got %.2f", sim)
+	}
+	d := e.Resolve("User works at OpenAI as a backend engineer", weak)
 	if d.Action != ActionAdd || len(m.got) != 0 {
 		t.Fatalf("want add without a call, got %s calls=%d", d.Action, len(m.got))
+	}
+}
+
+func TestMulti_OnlyCandidatesAtOrAboveThresholdAreSent(t *testing.T) {
+	m := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) { return ActionAdd, -1, "no", nil }}
+	e := NewEngine()
+	e.MaxCandidates = 5
+	e.Resolver = m
+	facts := []Fact{
+		{ID: "weak", Content: "User enjoys backend reading"},
+		{ID: "close", Content: "User works at Google as a backend engineer"},
+	}
+	e.Resolve("User works at OpenAI as a backend engineer", facts)
+	if len(m.got) != 1 || len(m.got[0]) != 1 || m.got[0][0] != "close" {
+		t.Fatalf("only the candidate at or above the threshold may be sent, got %v", m.got)
 	}
 }
 
@@ -425,5 +470,34 @@ func TestMulti_NotUsedWhenMaxCandidatesIsOne(t *testing.T) {
 	e.Resolve(crossSubjectNew, manyFacts())
 	if len(r.got) != 0 {
 		t.Fatalf("with MaxCandidates<=1 the single-candidate path is used, got batched calls %v", r.got)
+	}
+}
+
+func TestResolve_InvalidActionIsTreatedAsAnError(t *testing.T) {
+	bad := Action(99)
+	single := &scriptedResolver{decide: func(Fact) (Action, string, error) { return bad, "x", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = 3
+	e.Resolver = single
+	if d := e.Resolve(crossSubjectNew, crossSubjectFacts()); d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("walk: an undefined action must add, got %v target=%q", d.Action, d.TargetID)
+	}
+	multi := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) { return bad, 0, "x", nil }}
+	e.Resolver = multi
+	if d := e.Resolve(crossSubjectNew, manyFacts()); d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("batch: an undefined action must add, got %v target=%q", d.Action, d.TargetID)
+	}
+}
+
+func TestResolve_HugeMaxCandidatesDoesNotAllocateOrPanic(t *testing.T) {
+	m := &scriptedMulti{decide: func(string, []Fact) (Action, int, string, error) { return ActionAdd, -1, "no", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.1
+	e.MaxCandidates = math.MaxInt32
+	e.Resolver = m
+	d := e.Resolve(crossSubjectNew, manyFacts())
+	if d.Action != ActionAdd || len(m.got) != 1 || len(m.got[0]) != 4 {
+		t.Fatalf("want one call with all 4 candidates, got %s %v", d.Action, m.got)
 	}
 }

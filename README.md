@@ -56,7 +56,7 @@ e.ConflictThreshold = 0.1 // let weaker overlaps qualify
 e.MaxCandidates = 10      // at most ten judge calls per fact
 ```
 
-The first candidate the Resolver does not call `add` decides the outcome. If it errors after rejecting an earlier candidate, the fact is added and nothing is superseded. An error on the first candidate keeps the original behavior (the heuristic decides).
+The first candidate the Resolver does not call `add` decides the outcome. With `MaxCandidates` above one, any Resolver error or undefined action adds the fact and supersedes nothing, so a failing Resolver can never erase a stored fact. With the default (zero or one) behavior is exactly as before, including the heuristic fallback when the Resolver errors; a randomized differential test against the previous release checks this.
 
 A Resolver may also implement `MultiResolver` (`ResolveAmong`) to judge all candidates in one call. An invalid answer, or an error, adds the fact. In one evaluation with an 8B local model, a single batched call over ten candidates proposed a replacement for unrelated facts far too often; pairing it with a per-candidate check removed that damage but left more facts stale than judging candidates one at a time. Measure it with your own model before relying on it.
 
@@ -65,7 +65,7 @@ Very short antonym flips — "I love my job" → "I hate my job" — share only 
 
 ### Subject confusion
 
-The overlap score counts every shared word, including a person's name. Two different people who share a surname and a value ("Marisol Bellweather works at Harbor Partners", "Nadia Bellweather works at Harbor Partners") can score above the conflict threshold, so the bare heuristic may supersede the wrong person's fact. On a held-out synthetic evaluation with an Ollama judge, wrongful replacement fell from 72% to 8%, but stale facts were not reduced in general because the right fact was often outside the top candidates. See the MemKit evaluation write-up for the data and limits.
+The overlap score counts every shared word, including a person's name. Two different people who share a surname and a value ("Marisol Bellweather works at Harbor Partners", "Nadia Bellweather works at Harbor Partners") can score above the conflict threshold, so the bare heuristic may supersede the wrong person's fact. On a held-out synthetic evaluation with an Ollama judge (n=102 per category, one run, one 8B model), another person's fact was wrongly missing from the top five in 72% of cases with the heuristic and 8% with the judge, but stale facts were not reduced in general because the right fact was often outside the top candidates. Data, protocol and limits: [agent-rails/memkit pull request 2](https://github.com/agent-rails/memkit/pull/2), file `eval/EVAL_V2.md`.
 
 ## API
 
