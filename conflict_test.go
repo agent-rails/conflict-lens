@@ -1,6 +1,10 @@
 package conflict
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 func TestResolve_AddWhenUnrelated(t *testing.T) {
 	e := NewEngine()
@@ -117,5 +121,170 @@ func TestJaccard(t *testing.T) {
 	}
 	if got := jaccard(a, b); got <= 0 || got >= 1 {
 		t.Fatalf("partial overlap should be in (0,1), got %.2f", got)
+	}
+}
+
+type scriptedResolver struct {
+	calls  []string
+	decide func(candidate Fact) (Action, string, error)
+}
+
+func (s *scriptedResolver) Resolve(_ string, candidate Fact) (Action, string, error) {
+	s.calls = append(s.calls, candidate.ID)
+	return s.decide(candidate)
+}
+
+func sameSubject(subject string) func(Fact) (Action, string, error) {
+	return func(c Fact) (Action, string, error) {
+		if strings.Contains(c.Content, subject) {
+			return ActionUpdate, "same subject", nil
+		}
+		return ActionAdd, "different subject", nil
+	}
+}
+
+func crossSubjectFacts() []Fact {
+	return []Fact{
+		{ID: "other", Content: "Nadia Bellweather works at Harbor Partners"},
+		{ID: "mine", Content: "Marisol Bellweather works at Cinder Labs"},
+	}
+}
+
+const crossSubjectNew = "Marisol Bellweather works at Harbor Partners"
+
+func TestResolve_DefaultConsultsOnlyBestCandidate(t *testing.T) {
+	r := &scriptedResolver{decide: sameSubject("Marisol")}
+	e := NewEngine()
+	e.ConflictThreshold = 0.2
+	e.Resolver = r
+	d := e.Resolve(crossSubjectNew, crossSubjectFacts())
+	if len(r.calls) != 1 || r.calls[0] != "other" {
+		t.Fatalf("default must consult only the best-overlap candidate, got calls=%v", r.calls)
+	}
+	if d.Action != ActionAdd {
+		t.Fatalf("legacy behavior: want add after the best candidate is rejected, got %s", d.Action)
+	}
+}
+
+func TestResolve_MaxCandidatesWalksPastWrongSubject(t *testing.T) {
+	r := &scriptedResolver{decide: sameSubject("Marisol")}
+	e := NewEngine()
+	e.ConflictThreshold = 0.2
+	e.MaxCandidates = 3
+	e.Resolver = r
+	d := e.Resolve(crossSubjectNew, crossSubjectFacts())
+	if d.Action != ActionUpdate || d.TargetID != "mine" {
+		t.Fatalf("want update of 'mine', got %s target=%q", d.Action, d.TargetID)
+	}
+	if len(r.calls) != 2 || r.calls[0] != "other" || r.calls[1] != "mine" {
+		t.Fatalf("candidates must be consulted in similarity order, got %v", r.calls)
+	}
+}
+
+func TestResolve_MaxCandidatesAllRejectedIsAdd(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "no", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.2
+	e.MaxCandidates = 3
+	e.Resolver = r
+	d := e.Resolve(crossSubjectNew, crossSubjectFacts())
+	if d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("want add with no target, got %s target=%q", d.Action, d.TargetID)
+	}
+	if len(r.calls) != 2 {
+		t.Fatalf("both candidates in the band must be consulted, got %v", r.calls)
+	}
+}
+
+func TestResolve_MaxCandidatesBoundsResolverCalls(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "no", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.2
+	e.MaxCandidates = 2
+	e.Resolver = r
+	facts := []Fact{
+		{ID: "1", Content: "Marisol Bellweather works at Harbor Partners"},
+		{ID: "2", Content: "Nadia Bellweather works at Harbor Partners"},
+		{ID: "3", Content: "Idris Okonkwo works at Harbor Partners"},
+		{ID: "4", Content: "Ines Ferreira works at Harbor Partners"},
+	}
+	e.Resolve("Kenji Osgood works at Harbor Partners", facts)
+	if len(r.calls) != 2 {
+		t.Fatalf("resolver calls must be capped at MaxCandidates=2, got %v", r.calls)
+	}
+}
+
+func TestResolve_MaxCandidatesSkipsCandidatesBelowThreshold(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "no", nil }}
+	e := NewEngine()
+	e.MaxCandidates = 5
+	e.Resolver = r
+	facts := []Fact{
+		{ID: "close", Content: "User works at Google as a backend engineer"},
+		{ID: "far", Content: "User is allergic to shellfish"},
+	}
+	e.Resolve("User works at OpenAI as a backend engineer", facts)
+	if len(r.calls) != 1 || r.calls[0] != "close" {
+		t.Fatalf("only candidates at or above ConflictThreshold may be consulted, got %v", r.calls)
+	}
+}
+
+func TestResolve_ResolverErrorFallsBackToHeuristicOnBestCandidate(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "", errors.New("down") }}
+	e := NewEngine()
+	e.MaxCandidates = 3
+	e.Resolver = r
+	facts := []Fact{{ID: "old", Content: "User works at Google as a backend engineer"}}
+	d := e.Resolve("User works at OpenAI as a backend engineer", facts)
+	if d.Action != ActionUpdate || d.TargetID != "old" {
+		t.Fatalf("resolver error must keep the legacy heuristic update, got %s target=%q", d.Action, d.TargetID)
+	}
+	if len(r.calls) != 1 {
+		t.Fatalf("an error must stop the walk, got calls=%v", r.calls)
+	}
+}
+
+func TestResolve_DuplicateShortCircuitsBeforeResolver(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionUpdate, "", nil }}
+	e := NewEngine()
+	e.MaxCandidates = 3
+	e.Resolver = r
+	facts := []Fact{{ID: "d", Content: "User works at OpenAI as a backend engineer"}}
+	d := e.Resolve("User works at OpenAI as a backend engineer", facts)
+	if d.Action != ActionDuplicate || len(r.calls) != 0 {
+		t.Fatalf("duplicate must not consult the resolver, got %s calls=%v", d.Action, r.calls)
+	}
+}
+
+func TestResolve_TieOrderIsStableByInputOrder(t *testing.T) {
+	r := &scriptedResolver{decide: func(Fact) (Action, string, error) { return ActionAdd, "no", nil }}
+	e := NewEngine()
+	e.ConflictThreshold = 0.2
+	e.MaxCandidates = 3
+	e.Resolver = r
+	facts := []Fact{
+		{ID: "first", Content: "Idris Okonkwo works at Harbor Partners"},
+		{ID: "second", Content: "Ines Ferreira works at Harbor Partners"},
+	}
+	e.Resolve("Kenji Osgood works at Harbor Partners", facts)
+	if len(r.calls) != 2 || r.calls[0] != "first" || r.calls[1] != "second" {
+		t.Fatalf("equal similarity must keep input order, got %v", r.calls)
+	}
+}
+
+func TestResolve_ResolverErrorAfterRejectionKeepsBothFacts(t *testing.T) {
+	r := &scriptedResolver{decide: func(c Fact) (Action, string, error) {
+		if c.ID == "other" {
+			return ActionAdd, "different subject", nil
+		}
+		return ActionAdd, "", errors.New("down")
+	}}
+	e := NewEngine()
+	e.ConflictThreshold = 0.2
+	e.MaxCandidates = 3
+	e.Resolver = r
+	d := e.Resolve(crossSubjectNew, crossSubjectFacts())
+	if d.Action != ActionAdd || d.TargetID != "" {
+		t.Fatalf("an error after a rejection must not supersede the rejected candidate, got %s target=%q", d.Action, d.TargetID)
 	}
 }
